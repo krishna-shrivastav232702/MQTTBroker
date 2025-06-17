@@ -138,6 +138,14 @@ struct mqtt_ack{
     unsigned short pkt_id;
 };
 
+//remaining acknowledgement package
 
-
+typedef struct mqtt_ack mqtt_puback;
+typedef struct mqtt_ack mqtt_pubrec;
+typedef struct mqtt_ack mqtt_pubrel;
+typedef struct mqtt_ack mqtt_pubcomp;
+typedef struct mqtt_ack mqtt_unsuback;
+typedef union mqtt_header mqtt_pingreq;
+typedef union mqtt_header mqtt_pingresp;
+typedef union mqtt_header mqtt_disconnect;
 
