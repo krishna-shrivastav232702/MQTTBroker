@@ -107,7 +107,36 @@ struct mqtt_subscribe {
     }*tuples; //pointer to an array of subscription tuples,
 };
 
+struct mqtt_unsubscribe {
+    union mqtt_header header;
+    unsigned short pkt_id;
+    unsigned short tuples_len;
+    struct{
+        unsigned short topic_len;
+        unsigned char *topic;
+    }*tuples;
+};
 
+struct mqtt_suback{ //subscriber acknowledgement
+    union mqtt_header header;
+    unsigned short pkt_id;
+    unsigned short rcslen; //return codes length
+    unsigned char *rcs; //return codes
+};
+
+struct mqtt_publish {
+    union mqtt_header header;
+    unsigned short pkt_id;
+    unsigned short topiclen;
+    unsigned char *topic;
+    unsigned short payloadlen;
+    unsigned char *payload;
+};
+
+struct mqtt_ack{
+    union mqtt_header header;
+    unsigned short pkt_id;
+};
 
 
 
