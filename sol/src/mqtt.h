@@ -149,3 +149,39 @@ typedef union mqtt_header mqtt_pingreq;
 typedef union mqtt_header mqtt_pingresp;
 typedef union mqtt_header mqtt_disconnect;
 
+union mqtt_packet {
+    struct mqtt_ack ack;
+    union mqtt_header header;
+    struct mqtt_connect connect;
+    struct mqtt_connack connack;
+    struct mqtt_suback suback;
+    struct mqtt_publish publish;
+    struct mqtt_subscribe subscribe;
+    struct mqtt_unsubscribe unsubscribe;
+};
+
+int mqtt_encode_length(unsigned char* , size_t); 
+//unsigned char * — a pointer to a byte buffer
+//size_t — the actual length value to encode
+
+unsigned long long mqtt_decode_length(const unsigned char **); 
+// A pointer to a pointer to the byte buffer -> allows function to update the buffer pointer
+//Why double pointer?
+//Because the function needs to:
+//Read from the buffer (e.g., bytes like 0x80 0x01)
+//Then advance the buffer pointer past the encoded length, so the caller knows where the rest of the packet starts.
+
+int unpack_mqtt_packet(const unsigned char*, union mqtt_packet *); //Used on the receiving side, after getting raw bytes from the socket
+unsigned char *pack_mqtt_packet(const union mqtt_packet *,unsigned); 
+//Used on the sending side to convert a high-level packet structure into the correct MQTT wire format.
+//It takes a structured MQTT packet and converts it into a raw byte stream for sending over the network.
+
+
+union mqtt_header* mqtt_packet_header(unsigned char);
+struct mqtt_ack* mqtt_packet_ack(unsigned char, unsigned short);
+struct mqtt_connack* mqtt_packet_connack(unsigned char,unsigned char, unsigned char);
+struct mqtt_suback* mqtt_packet_suback(unsigned char, unsigned short,unsigned char*, unsigned short);
+struct mqtt_publish* mqtt_packet_publish(unsigned char,unsigned short,size_t,unsigned char *,size_t,unsigned char*);
+void mqtt_packet_release(union mqtt_packet *, unsigned);
+
+#endif
