@@ -89,3 +89,164 @@ static size_t unpack_mqtt_connect(const unsigned char *buf,union mqtt_header *hd
 
     return len; //Returns how many bytes were used in the variable header and payload
 }
+
+
+static size_t unpack_mqtt_publish(const unsigned char *buf,union mqtt_header *hdr,union mqtt_packet *pkt){
+    struct mqtt_publish publish = {.header = *hdr};
+    pkt->publish = publish;
+    size_t len = mqtt_decode_length(&buf);
+    pkt->publish.topiclen = unpack_string16(&buf, &pkt->publish.topic);
+    uint16_t message_len = len;
+    //read packet id
+    if(publish.header.bits.qos > AT_MOST_ONCE){
+        pkt->publish.pkt_id = unpack_u16((const uint8_t **)&buf);
+        message_len -= sizeof(uint16_t);
+    }
+
+    //Message len is calculated subtracting the length of the variable header from the Remaining Length field
+
+    message_len = message_len - (sizeof(uint16_t)+topiclen);
+    pkt->publish.payloadlen = message_len;
+    pkt->publish.payload = malloc(message_len+1);
+    unpack_bytes((const uint8_t **)&buf,message_len,pkt->publish.payload);
+    return len;
+}
+
+// subscribe and unsubscribe packets --> same as PUBLISH Packet 
+// but for payload they have a list of tuple consisting in a pair (topic,QoS)
+
+
+static size_t unpack_mqtt_subscribe(const unsigned char* buf, union mqtt_header *hdr,union mqtt_packet *pkt){
+    struct mqtt_subscribe subscribe = {.header = *hdr};
+    //Second byte of the fixed header, contains the length of remaining bytes of the connect packet
+    size_t len = mqtt_decode_length(&buf);
+    size_t remaining_bytes = len;
+    // read packet id
+    subscribe.pkt_id = unpack_u16((const uint8_t **)&buf);
+    //unpack_u16() reads two bytes (network → host order) for the Packet Identifier, then advances buf by 2.
+    remaining_bytes -= sizeof(uint16_t); //decrement remaining_bytes by 2 to keep count of what’s left.
+    
+    // from now payload consists of 3-tuples formed by:
+    // topic length
+    // topic filter(string)
+    // qos
+
+    int i = 0;
+    while(remaining_bytes > 0){
+        // read length bytes of the first topic filter
+        remaining_bytes -= sizeof(uint16_t);
+        subscribe.tuples = realloc(subscribe.tuples,(i+1)*sizeof(*subscribe.tuples)); //Allocate space for one more tuple
+        subscribe.tuples[i].topic_len = unpack_string16(&buf,&subscribe.tuples[i].topic);//Read the topic length & topic string
+        remaining_bytes -= subscribe.tuples[i].topic_len;
+        
+        //Read the QoS byte
+        subscribe.tuples[i].qos = unpack_u8((const uint8_t **)&buf);
+        len -= sizeof(uint8_t);
+        i++; 
+    }
+    //Store how many tuples we parsed in tuples_len.
+    // Copy our local subscribe struct into the output union pkt->subscribe
+    subscribe.tuples_len = i;
+    pkt->subscribe = subscribe;
+    return len;
+}
+
+
+//MQTT packet structure
+// Fixed Header
+//    +-- Packet Type & Flags (1 byte)
+//    +-- Remaining Length (1–4 bytes)
+// Variable Header
+//    +-- Packet ID (2 bytes)
+// Payload
+//    +-- Repeated topic filters
+
+
+//from a raw byte buffer (buf) into a structured format (mqtt_packet union
+//size_t return length of the remaining bytes
+static size_t unpack_mqtt_unsubscribe(const unsigned char *buf, union mqtt_header *hdr, union mqtt_packet *pkt){
+    struct mqtt_unsubscribe unsubscribe = { .header = *hdr };
+    size_t len = mqtt_decode_length(&buf); //which tells how many bytes come after the fixed header.
+    size_t remaining_bytes = len;
+    // read packet id
+    unsubscribe.pkt_id = unpack_u16((const uint8_t **)&buf);
+    remaining_bytes -= sizeof(uint16_t);
+
+    //from now payload consist of 2 tuples formed by 
+    // topic len
+    // topic filter
+
+    //Read Payload (Topic Filters)
+    int i = 0;
+    while(remaining_bytes > 0){
+        remaining_bytes -= sizeof(uint16_t);
+        //Each time a new topic is found, the array of topic filters (tuples) must grow
+        unsubscribe.tuples = realloc(unsubscribe.tuples, (i+1)*sizeof(*unsubscribe.tuples));
+        //That returned length is saved into unsubscribe.tuples[i].topic_len.
+        // The actual string is stored in unsubscribe.tuples[i].topic.
+        unsubscribe.tuples[i].topic_len = unpack_string16(&buf,&unsubscribe.tuples[i].topic);
+        remaining_bytes -= unsubscribe.tuples[i].topic_len;
+        i++;
+    }
+
+    unsubscribe.tuples_len = i;
+    pkt->unsubscribe = unsubscribe;
+    return len;
+}
+
+static size_t unpack_mqtt_ack(const unsigned char *buf, union mqtt_header *hdr, union mqtt_packet *pkt){
+    struct mqtt_ack ack = { .header = *hdr };
+    size_t len = mqtt_decode_length(&buf);
+    ack.pkt_id = unpack_u16((const uint8_t **)&buf);
+    return len;
+}
+
+//defining a new type alias
+typedef size_t mqtt_unpack_handler(const unsigned char *,union mqtt_header *,union mqtt_packet *);
+
+
+// Unpack functions mapping unpacking_handlers positioned in the array based on message type
+
+//So unpack_handlers[i] is a pointer to a function that unpacks a specific type of MQTT packet and returns a size_t.
+static mqtt_unpack_handler *unpack_handlers[11]={
+    NULL,
+    unpack_mqtt_connect,
+    NULL,
+    unpack_mqtt_publish,
+    unpack_mqtt_ack,
+    unpack_mqtt_ack,
+    unpack_mqtt_ack,
+    unpack_mqtt_ack,
+    unpack_mqtt_subscribe,
+    NULL,
+    unpack_mqtt_unsubscribe
+};
+
+//| Index | MQTT Packet Type | Function Assigned         |
+// | ----- | ---------------- | ------------------------- |
+// | 0     | Reserved         | `NULL`                    |
+// | 1     | CONNECT          | `unpack_mqtt_connect`     |
+// | 2     | CONNACK          | `NULL`                    |
+// | 3     | PUBLISH          | `unpack_mqtt_publish`     |
+// | 4     | PUBACK           | `unpack_mqtt_ack`         |
+// | 5     | PUBREC           | `unpack_mqtt_ack`         |
+// | 6     | PUBREL           | `unpack_mqtt_ack`         |
+// | 7     | PUBCOMP          | `unpack_mqtt_ack`         |
+// | 8     | SUBSCRIBE        | `unpack_mqtt_subscribe`   |
+// | 9     | SUBACK           | `NULL`                    |
+// | 10    | UNSUBSCRIBE      | `unpack_mqtt_unsubscribe` |
+
+// the above implementaion using array eliminates the switch-case and makes the design modular and efficient
+
+int unpack_mqtt_packet(const unsigned char *buf,union mqtt_packet *pkt){
+    int rc = 0;
+    unsigned char type = *buf;
+    union mqtt_header header{
+        .byte = type
+    };
+    if(header.bits.type == DISCONNECT || header.bits.type == PINGREQ || header.bits.type == PINGRESP)
+        pkt->header = header;
+    else
+        rc = unpack_handlers[header.bits.type](++buf,&header,pkt);
+    return rc;
+}
