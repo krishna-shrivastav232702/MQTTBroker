@@ -184,3 +184,207 @@ err:
     return -1;    
 }
 
+
+typedef union epoll_data{ 
+    void* ptr;
+    int fd;
+    uint32_t u32;
+    uint64_t u64;
+}epoll_data_t;
+
+
+#define EVLOOP_INITIAL_SIZE 4
+
+struct evloop* evloop_create(int max_events,int timeout){
+    struct evloop* loop = malloc(sizeof(*loop));
+    evloop_init(loop,max_events,timeout);
+    return loop;
+}
+
+//struct epoll_event {
+    // uint32_t     events;    // Epoll events (e.g., EPOLLIN, EPOLLOUT)
+    // epoll_data_t data;      // User data (usually you set .fd or .ptr)
+// };
+
+void evloop_init(struct evloop* loop,int max_events,int timeout){
+    loop->max_events = max_events;
+    loop->events = malloc(sizeof(struct epoll_event)*max_events);
+    loop->epollfd = epoll_create1(0);
+    loop->timeout = timeout;
+    loop->periodic_maxsize = EVLOOP_INITIAL_SIZE;
+    loop->periodic_nr = 0;
+    loop->periodic_tasks = malloc(EVLOOP_INITIAL_SIZE * sizeof(*loop->periodic_tasks));
+    loop->status = 0;
+}
+
+
+void evloop_free(struct evloop* loop){
+    free(loop->events);
+    for(int i = 0;i<loop->periodic_nr;i++)
+        free(loop->periodic_tasks[i]);
+    free(loop->periodic_tasks);
+    free(loop);
+}
+
+
+int epoll_add(int efd,int fd,int evs,void* data){
+    struct epoll_event ev;
+    ev.data.fd = fd;
+    if(data)
+        ev.data.ptr = data;
+    //EPOLLET — Edge-Triggered Mode ->Only notify me when new data arrives, not as long as data is available.
+    //EPOLLONESHOT — One-shot Notification -> Notify me only once. I’ll manually rearm it.
+    //useful for multi threaded servers -> to ensure only one thread handles a socket at a time
+    ev.events = evs | EPOLLET | EPOLLONESHOT;
+    //  combo of EPOLLET | EPOLLONESHOT 
+    //  Edge-triggered for fewer notifications
+    //  One-shot so only one thread handles the event, and you rearm when you're ready
+
+
+    return epoll_ctl(efd,EPOLL_CTL_ADD,fd,&ev);
+}
+
+int epoll_mod(int efd,int fd,int evs,void* data){
+    struct epoll_event ev;
+    ev.data.fd =fd;
+    if(data)
+        ev.data.ptr = data;
+    ev.events = evs | EPOLLET | EPOLLONESHOT;
+    return epoll_ctl(efd,EPOLL_CTL_MOD,fd,&ev);
+}
+
+int epoll_del(int efd,int fd){
+    return epoll_ctl(efd,EPOLL_CTL_DEL,fd,NULL);
+}
+
+void evloop_add_callback(struct evloop* loop,struct closure* cb){
+    if(epoll_add(loop->epollfd,cb->fd,EPOLLIN,cb)<0)
+        perror("Epoll register callback");
+}
+
+//adds a periodic task (i.e., a function to run every seconds + ns) to a custom event loop
+void evloop_add_periodic_task(struct evloop* loop,int seconds,unsigned long long ns, struct closure* cb){
+    // struct timerspec {
+    //     time_t tv_sec;
+    //     long tv_nsec;
+    // }
+    // struct itimerspec {
+    //      struct timerspec it_interval;  time interval
+    //      struct timerspec it_value;     initial expiration
+    // }
+    struct itimerspec timervalue; //itimerspec used with POSIX timers -> time.h -> Interval Timer Specification
+    
+    //int timerfd_create(int clockid, int flags);
+    // It returns a file descriptor that becomes readable whenever the timer expires.
+    int timerfd = timerfd_create(CLOCK_MONOTONIC,0); // creates a timer file descriptor using timerfd_create() system call
+    //a Linux-specific feature that lets you use timers as file descriptors (which can be monitored with epoll, poll, or select)
+
+    memset(&timervalue,0x00,sizeof(timervalue));
+
+    // set initial expire time and periodic interval
+
+    timervalue.it_value.tv_sec = seconds;
+    timervalue.it_value.tv_nsec = ns;
+    timervalue.it_interval.tv_sec = seconds;
+    timervalue.it_interval.tv_nsec = ns;
+    
+    // This sets both:
+    //     it_value: when the timer first fires
+    //     it_interval: how often to repeat afterward
+    //     If it_interval is 0, the timer would be one-shot (not repeating).
+
+    if(timerfd_settime(timerfd,0,&timervalue,NULL)<0){
+        perror("timerfd_settime");
+        return;
+    }
+
+    struct epoll_event ev;
+    ev.data.fd = timerfd;
+    ev.events = EPOLLIN;
+
+    if(epoll_ctl(loop->epollfd,EPOLL_CTL_ADD,timerfd,&ev)<0){  //Whenever the timer expires, epoll_wait() will return this fd as ready for reading.
+        perror("epoll_ctl(2): EPOLLIN");
+        return;
+    }
+
+    //This checks if the internal storage array (periodic_tasks) is large enough to hold another task.
+    //If not, it doubles the size using realloc
+    if(loop->periodic_nr + 1 > loop->periodic_maxsize){
+        loop->periodic_maxsize *= 2;
+        loop->periodic_tasks = realloc(loop->periodic_tasks,loop->periodic_maxsize * sizeof(*loop->periodic_tasks));
+    }
+    
+    loop->periodic_tasks[loop->periodic_nr] = malloc(sizeof(*loop->periodic_tasks[loop->periodic_nr]));
+    loop->periodic_tasks[loop->periodic_nr]->closure = cb;
+    loop->periodic_tasks[loop->periodic_nr]->timerfd = timerfd;
+    loop->periodic_nr++;
+}
+
+
+int evloop_wait(struct evloop* el){
+    int rc = 0;
+    int events = 0;
+    long int timer = 0L; // Placeholder for timerfd read
+    int periodic_done = 0; // Flag to check if this is a timerfd
+    while(1){
+
+        // el->epollfd: epoll instance
+        // el->events: array of epoll_event structs
+        // el->max_events: how many events to wait for
+        // el->timeout: how long to wait (can be infinite or 0)
+        events = epoll_wait(el->epollfd, el->events,el->max_events,el->timeout);
+        
+        if(events<0){
+            if(errno == EINTR) continue; 
+            // EINTR stands for "Interrupted system call" ->It indicates that a blocking system call was interrupted by a signal.
+            rc = -1;
+            el->status = errno;
+            break;
+            //if a real error, save it and exit loop.
+        }
+
+        // If the event has EPOLLERR (error) or EPOLLHUP (hang up), or is not readable/writable:
+        // Shut down and close the FD
+        // Skip this event
+        
+        for(int i = 0;i<events;i++){
+            if((el->events[i].events & EPOLLERR) || (el->events[i].events & EPOLLHUP) ||
+            (!(el->events[i].events & EPOLLIN) && !(el->events[i].events & EPOLLOUT))){
+                perror("epoll_wait(2)");
+                shutdown(el->events[i].data.fd,0);
+                close(el->events[i].data.fd);
+                el->status = errno;
+                continue;
+            }
+            struct closure* closure = el->events[i].data.ptr;
+            //check if its a periodic task
+            periodic_done = 0;
+            for(int i = 0;i<el->periodic_nr && periodic_done == 0;i++){
+                if(el->events[i].data.fd == el->periodic_tasks[i]->timerfd){
+                    // struct closure ->encapsultes a function and its context
+                    struct closure* c = el->periodic_tasks[i]->closure; // calls its associated closure
+                    (void) read(el->events[i].data.fd,&timer,8);
+                    c->call(el,c->args);
+                    periodic_done = 1; // mark this to stop further processing
+                }
+            }
+            if(periodic_done == 1) continue;
+            closure->call(el,closure->args);//If this wasn't a timer, call the generic handler stored in closure.
+        }
+    }
+    return rc;
+    //0 if all good
+    //-1 if an error happened
+}
+
+int evloop_rearm_callback_read(struct evloop* el,struct closure* cb){
+    return epoll_mod(el->epollfd,cb->fd,EPOLLIN,cb);
+}
+
+int evloop_rearm_callback_write(struct evloop* el,struct closure* cb){
+    return epoll_mod(el->epollfd,cb->fd,EPOLLOUT,cb);
+}
+
+int evloop_del_callback(struct evloop* el,struct closure* cb){
+    return epoll_del(el->epollfd,cb->fd);
+}
