@@ -17,4 +17,17 @@ void pack_u16(uint8_t **,uint16_t); //append a uint16_t -> bytes into the bytest
 void pack_u32(uint8_t **,uint32_t); //append a uint32_t -> bytes into the bytestring
 void pack_bytes(uint8_t **,uint8_t *); //append len bytes into the bytestring
 
+
+// bytestring structure -> convenient way of handling byte string data
+struct bytestring{
+    size_t size;
+    size_t last;
+    unsigned char* data;
+}
+
+struct bytestring* bytestring_create(size_t);
+void bytestring_init(struct bytestring*,size_t);
+void bytestring_release(struct bytestring*);
+void bytestring_reset(struct bytestring*);
+
 #endif
