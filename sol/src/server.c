@@ -434,10 +434,289 @@ publish_message(0, strlen(sys_topics[12]), sys_topics[12],
 strlen(mrecv), (unsigned char *) &mrecv);
 }
 
+static int connect_handler(struct closure *cb, union mqtt_packet *pkt) {
+
+    // TODO just return error_code and handle it on `on_read`
+    if (hashtable_exists(sol.clients,
+                         (const char *) pkt->connect.payload.client_id)) {
+
+        // Already connected client, 2 CONNECT packet should be interpreted as
+        // a violation of the protocol, causing disconnection of the client
+
+        sol_info("Received double CONNECT from %s, disconnecting client",
+                 pkt->connect.payload.client_id);
+
+        close(cb->fd);
+        hashtable_del(sol.clients, (const char *) pkt->connect.payload.client_id);
+        hashtable_del(sol.closures, cb->closure_id);
+
+        // Update stats
+        info.nclients--;
+        info.nconnections--;
+
+        return -REARM_W;
+    }
+    sol_info("New client connected as %s (c%i, k%u)",
+             pkt->connect.payload.client_id,
+             pkt->connect.bits.clean_session,
+             pkt->connect.payload.keepalive);
+
+    /*
+     * Add the new connected client to the global map, if it is already
+     * connected, kick him out accordingly to the MQTT v3.1.1 specs.
+     */
+    struct sol_client *new_client = malloc(sizeof(*new_client));
+    new_client->fd = cb->fd;
+    const char *cid = (const char *) pkt->connect.payload.client_id;
+    new_client->client_id = strdup(cid);
+    hashtable_put(sol.clients, cid, new_client);
+
+    /* Substitute fd on callback with closure */
+    cb->obj = new_client;
+
+    /* Respond with a connack */
+    union mqtt_packet *response = malloc(sizeof(*response));
+    unsigned char byte = CONNACK_BYTE;
+
+    // TODO check for session already present
+
+    if (pkt->connect.bits.clean_session == false)
+        new_client->session.subscriptions = list_create(NULL);
+
+    unsigned char session_present = 0;
+    unsigned char connect_flags = 0 | (session_present & 0x1) << 0;
+    unsigned char rc = 0;  // 0 means connection accepted
+
+    response->connack = *mqtt_packet_connack(byte, connect_flags, rc);
+
+    cb->payload = bytestring_create(MQTT_ACK_LEN);
+    unsigned char *p = pack_mqtt_packet(response, CONNACK);
+    memcpy(cb->payload->data, p, MQTT_ACK_LEN);
+    free(p);
+
+    sol_debug("Sending CONNACK to %s (%u, %u)",
+              pkt->connect.payload.client_id,
+              session_present, rc);
+
+    free(response);
+
+    return REARM_W;
+}
+
+
+static int disconnect_handler(struct closure *cb, union mqtt_packet *pkt) {
+    // TODO just return error_code and handle it on `on_read`
+    /* Handle disconnection request from client */
+    struct sol_client *c = cb->obj;
+    sol_debug("Received DISCONNECT from %s", c->client_id);
+    close(c->fd);
+    hashtable_del(sol.clients, c->client_id);
+    hashtable_del(sol.closures, cb->closure_id);
+    // Update stats
+    info.nclients--;
+    info.nconnections--;
+    // TODO remove from all topic where it subscribed
+    return -REARM_W;
+}
 
 
 
+static void recursive_subscription(struct trie_node *node, void *arg) {
+    if (!node || !node->data)
+        return;
+    struct list_node *child = node->children->head;
+    for (; child; child = child->next)
+        recursive_subscription(child->data, arg);
+    struct topic *t = node->data;
+    struct subscriber *s = arg;
+    t->subscribers = list_push(t->subscribers, s);
+}
+
+static int subscribe_handler(struct closure *cb, union mqtt_packet *pkt) {
+    struct sol_client *c = cb->obj;
+    bool wildcard = false;
+    bool alloced = false;
+
+    /*
+     * We respond to the subscription request with SUBACK and a list of QoS in
+     * the same exact order of reception
+     */
+    unsigned char rcs[pkt->subscribe.tuples_len];
+
+    /* Subscribe packets contains a list of topics and QoS tuples */
+    for (unsigned i = 0; i < pkt->subscribe.tuples_len; i++) {
+        sol_debug("Received SUBSCRIBE from %s", c->client_id);
+        /*
+         * Check if the topic exists already or in case create it and store in
+         * the global map
+         */
+        char *topic = (char *) pkt->subscribe.tuples[i].topic;
+        sol_debug("\t%s (QoS %i)", topic, pkt->subscribe.tuples[i].qos);
+        /* Recursive subscribe to all children topics if the topic ends with "/#" */
+        if (topic[pkt->subscribe.tuples[i].topic_len - 1] == '#' &&
+            topic[pkt->subscribe.tuples[i].topic_len - 2] == '/') {
+            topic = remove_occur(topic, '#');
+            wildcard = true;
+        } else if (topic[pkt->subscribe.tuples[i].topic_len - 1] != '/') {
+            topic = append_string((char *) pkt->subscribe.tuples[i].topic, "/", 1);
+            alloced = true;
+        }
+        struct topic *t = sol_topic_get(&sol, topic);
+
+        // TODO check for callback correctly set to obj
+        if (!t) {
+            t = topic_create(strdup(topic));
+            sol_topic_put(&sol, t);
+        } else if (wildcard == true) {
+            struct subscriber *sub = malloc(sizeof(*sub));
+            sub->client = cb->obj;
+            sub->qos = pkt->subscribe.tuples[i].qos;
+            trie_prefix_map_tuple(&sol.topics, topic,
+                                  recursive_subscription, sub);
+        }
+
+        // Clean session true for now
+        topic_add_subscriber(t, cb->obj, pkt->subscribe.tuples[i].qos, true);
+        if (alloced)
+            free(topic);
+        rcs[i] = pkt->subscribe.tuples[i].qos;
+    }
+    struct mqtt_suback *suback = mqtt_packet_suback(SUBACK_BYTE,
+                                                    pkt->subscribe.pkt_id,
+                                                    rcs,
+                                                    pkt->subscribe.tuples_len);
+    mqtt_packet_release(pkt, SUBSCRIBE);
+    pkt->suback = *suback;
+    unsigned char *packed = pack_mqtt_packet(pkt, SUBACK);
+    size_t len = MQTT_HEADER_LEN + sizeof(uint16_t) + pkt->subscribe.tuples_len;
+    cb->payload = bytestring_create(len);
+    memcpy(cb->payload->data, packed, len);
+    free(packed);
+    mqtt_packet_release(pkt, SUBACK);
+    free(suback);
+    sol_debug("Sending SUBACK to %s", c->client_id);
+    return REARM_W;
+}
+
+static int unsubscribe_handler(struct closure *cb, union mqtt_packet *pkt) {
+    struct sol_client *c = cb->obj;
+    sol_debug("Received UNSUBSCRIBE from %s", c->client_id);
+    pkt->ack = *mqtt_packet_ack(UNSUBACK_BYTE, pkt->unsubscribe.pkt_id);
+    unsigned char *packed = pack_mqtt_packet(pkt, UNSUBACK);
+    cb->payload = bytestring_create(MQTT_ACK_LEN);
+    memcpy(cb->payload->data, packed, MQTT_ACK_LEN);
+    free(packed);
+    sol_debug("Sending UNSUBACK to %s", c->client_id);
+    return REARM_W;
+}
 
 
 
+static int publish_handler(struct closure *cb, union mqtt_packet *pkt) {
+    struct sol_client *c = cb->obj;
+    sol_debug("Received PUBLISH from %s (d%i, q%u, r%i, m%u, %s, ... (%i bytes))",
+              c->client_id,
+              pkt->publish.header.bits.dup,
+              pkt->publish.header.bits.qos,
+              pkt->publish.header.bits.retain,
+              pkt->publish.pkt_id,
+              pkt->publish.topic,
+              pkt->publish.payloadlen);
+    info.messages_recv++;
+    char *topic = (char *) pkt->publish.topic;
+    bool alloced = false;
+    unsigned char qos = pkt->publish.header.bits.qos;
 
+    /*
+     * For convenience we assure that all topics ends with a '/', indicating a
+     * hierarchical level
+     */
+    if (topic[pkt->publish.topiclen - 1] != '/') {
+        topic = append_string((char *) pkt->publish.topic, "/", 1);
+        alloced = true;
+    }
+
+    /*
+     * Retrieve the topic from the global map, if it wasn't created before,
+     * create a new one with the name selected
+     */
+    struct topic *t = sol_topic_get(&sol, topic);
+    if (!t) {
+        t = topic_create(strdup(topic));
+        sol_topic_put(&sol, t);
+    }
+
+    // Not the best way to handle this
+    if (alloced == true)
+        free(topic);
+    size_t publen;
+    unsigned char *pub;
+    struct list_node *cur = t->subscribers->head;
+    for (; cur; cur = cur->next) {
+        publen = MQTT_HEADER_LEN + sizeof(uint16_t) +
+            pkt->publish.topiclen + pkt->publish.payloadlen;
+        struct subscriber *sub = cur->data;
+        struct sol_client *sc = sub->client;
+
+        /* Update QoS according to subscriber's one */
+        pkt->publish.header.bits.qos = sub->qos;
+        if (pkt->publish.header.bits.qos > AT_MOST_ONCE)
+            publen += sizeof(uint16_t);
+        int remaininglen_offset = 0;
+        if ((publen - 1) > 0x200000)
+            remaininglen_offset = 3;
+        else if ((publen - 1) > 0x4000)
+            remaininglen_offset = 2;
+        else if ((publen - 1) > 0x80)
+            remaininglen_offset = 1;
+        publen += remaininglen_offset;
+        pub = pack_mqtt_packet(pkt, PUBLISH);
+        ssize_t sent;
+        if ((sent = send_bytes(sc->fd, pub, publen)) < 0)
+            sol_error("Error publishing to %s: %s",
+                      sc->client_id, strerror(errno));
+
+        // Update information stats
+        info.bytes_sent += sent;
+        sol_debug("Sending PUBLISH to %s (d%i, q%u, r%i, m%u, %s, ... (%i bytes))",
+                  sc->client_id,
+                  pkt->publish.header.bits.dup,
+                  pkt->publish.header.bits.qos,
+                  pkt->publish.header.bits.retain,
+                  pkt->publish.pkt_id,
+                  pkt->publish.topic,
+                  pkt->publish.payloadlen);
+        info.messages_sent++;
+        free(pub);
+    }
+
+    // TODO free publish
+    if (qos == AT_LEAST_ONCE) {
+        mqtt_puback *puback = mqtt_packet_ack(PUBACK_BYTE, pkt->publish.pkt_id);
+        mqtt_packet_release(pkt, PUBLISH);
+        pkt->ack = *puback;
+        unsigned char *packed = pack_mqtt_packet(pkt, PUBACK);
+        cb->payload = bytestring_create(MQTT_ACK_LEN);
+        memcpy(cb->payload->data, packed, MQTT_ACK_LEN);
+        free(packed);
+        sol_debug("Sending PUBACK to %s", c->client_id);
+        return REARM_W;
+    } else if (qos == EXACTLY_ONCE) {
+        // TODO add to a hashtable to track PUBREC clients last
+        mqtt_pubrec *pubrec = mqtt_packet_ack(PUBREC_BYTE, pkt->publish.pkt_id);
+        mqtt_packet_release(pkt, PUBLISH);
+        pkt->ack = *pubrec;
+        unsigned char *packed = pack_mqtt_packet(pkt, PUBREC);
+        cb->payload = bytestring_create(MQTT_ACK_LEN);
+        memcpy(cb->payload->data, packed, MQTT_ACK_LEN);
+        free(packed);
+        sol_debug("Sending PUBREC to %s", c->client_id);
+        return REARM_W;
+    }
+    mqtt_packet_release(pkt, PUBLISH);
+    /*
+     * We're in the case of AT_MOST_ONCE QoS level, we don't need to sent out
+     * any byte, it's a fire-and-forget.
+     */
+    return REARM_R;
+}

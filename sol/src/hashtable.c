@@ -1,4 +1,8 @@
 #include "hashtable.h"
+#include <assert.h>
+#include <string.h>
+#include <stdlib.h>
+#include "util.h"
 
 struct hashtable {
     size_t table_size;
@@ -123,12 +127,12 @@ HashTable *hashtable_create(int (*destructor)(struct hashtable_entry *)) {
     HashTable *table = malloc(sizeof(HashTable));
     if(!table)
         return NULL;
+    table->destructor = destructor ? destructor : destroy_entry;
     table->entries = calloc(INITIAL_SIZE, sizeof(struct hashtable_entry));
     if(!table->entries) {
         hashtable_release(table);
         return NULL;
     }
-    table->destructor = destructor ? destructor : destroy_entry;
     table->table_size = INITIAL_SIZE;
     table->size = 0;
     return table;
@@ -224,6 +228,7 @@ int hashtable_del(HashTable *table, const char *key) {
  * representing the key-value pair structure.
  */
 int hashtable_map(HashTable *table, int (*func)(struct hashtable_entry *)) {
+    if (!func) return -HASHTABLE_ERR;
     assert(func);
     /* On empty hashmap, return immediately */
     if (!table || table->size <= 0)

@@ -105,7 +105,7 @@ static size_t unpack_mqtt_publish(const unsigned char *buf,union mqtt_header *hd
 
     //Message len is calculated subtracting the length of the variable header from the Remaining Length field
 
-    message_len = message_len - (sizeof(uint16_t)+topic_len);
+    message_len = message_len - (sizeof(uint16_t) + pkt->publish.topiclen);
     pkt->publish.payloadlen = message_len;
     pkt->publish.payload = malloc(message_len+1);
     unpack_bytes((const uint8_t **)&buf,message_len,pkt->publish.payload);
@@ -198,6 +198,7 @@ static size_t unpack_mqtt_ack(const unsigned char *buf, union mqtt_header *hdr, 
     struct mqtt_ack ack = { .header = *hdr };
     size_t len = mqtt_decode_length(&buf);
     ack.pkt_id = unpack_u16((const uint8_t **)&buf);
+    pkt->ack = ack;
     return len;
 }
 
@@ -420,7 +421,7 @@ static unsigned char* pack_mqtt_publish(const union mqtt_packet* pkt){
     pktlen += remaininglen_offset;
     unsigned char* packed = malloc(pktlen);
     unsigned char* ptr = packed;
-    pack_u8(&pkt,pkt->publish.header.byte);
+    pack_u8(&ptr, pkt->publish.header.byte);
     len += (pktlen - MQTT_HEADER_LEN - remaininglen_offset);
     
     int step = mqtt_encode_length(ptr,len);
