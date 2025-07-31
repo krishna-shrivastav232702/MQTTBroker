@@ -1,3 +1,5 @@
+#include "hashtable.h"
+
 struct hashtable {
     size_t table_size;
     size_t size;
