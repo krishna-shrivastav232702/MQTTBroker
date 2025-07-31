@@ -23,6 +23,35 @@
 #define REARM_W 1
 
 int start_server(const char*, const char*);
+struct sol_info {
+    /* Number of clients currently connected */
+    int nclients;
+    /* Total number of clients connected since the start */
+    int nconnections;
+    /* Timestamp of the start time */
+    long long start_time;
+    /* Total number of bytes received */
+    long long bytes_recv;
+    /* Total number of bytes sent out */
+    long long bytes_sent;
+    /* Total number of sent messages */
+    long long messages_sent;
+    /* Total number of received messages */
+    long long messages_recv;
+};
+
+
+struct closure sys_closure = {
+    .fd = 0,
+    .payload = NULL,
+    .args = &sys_closure,
+    .call = publish_stats
+};
+
+generate_uuid(sys_closure.closure_id);
+
+/* Schedule as periodic task to be executed every N seconds */
+evloop_add_periodic_task(event_loop, conf->stats_pub_interval,0, &sys_closure);
 
 #endif
 
