@@ -2,7 +2,7 @@
 #include<stdlib.h>
 #include<arpa/inet.h>
 #include "pack.h"
- 
+
 
 //functions for reading data
 uint8_t unpack_u8(const uint8_t **buf){
@@ -33,7 +33,7 @@ uint8_t* unpack_bytes(const uint8_t **buf, size_t len,uint8_t *str){
 }
 
 //unpack_u16() reads 2 bytes from the buffer and converts it from network byte order (big-endian) to host byte order.
-uint8_t unpack_string16(uint8_t **buf,uint8_t **dest){
+uint16_t unpack_string16(const uint8_t **buf,uint8_t **dest){
     uint16_t len = unpack_u16(buf);
     *dest = malloc(len+1); //Allocates len + 1 bytes of memory to store the string and a null-terminator (\0).
     *dest = unpack_bytes(buf,len,*dest);
