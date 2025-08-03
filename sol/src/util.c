@@ -1,3 +1,10 @@
+#include <assert.h>
+#include <stdarg.h>
+#include <time.h>
+#include <uuid/uuid.h>
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
 static FILE *fh = NULL;
 
 void sol_log_init(const char *file) {

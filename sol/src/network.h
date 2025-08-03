@@ -46,7 +46,7 @@ typedef void callback(struct evloop*, void*);
 struct closure {
     int fd;
     void* obj;
-    void* agrs;
+    void* args;
     char closure_id[UUID_LEN];
     struct bytestring* payload;
     callback* call;

@@ -1,4 +1,20 @@
 #define _DEFAULT_SOURCE
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <netdb.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <sys/epoll.h>
+#include <sys/timerfd.h>
+#include <time.h>
+#include "network.h"
+#include "config.h"
 
 int set_nonblocking(int fd){
     int flags,result;
@@ -27,7 +43,7 @@ static int create_and_bind_unix(const char* sockpath){
     //AF_UNIX(/AF_LOCAL) -> Address family UNIX -> used for unix domain sockets 
     // these are local sockets : they allow interprocess communication(ICP) on same machine
     // they use a file path instead of IP address and port
-    if((fd == socket(AF_UNIX, SOCK_STREAM, 0))==-1){
+    if((fd = socket(AF_UNIX, SOCK_STREAM, 0))==-1){
         perror("socket error");
         return -1;
     }
@@ -91,7 +107,7 @@ int create_and_bind(const char* host,const char* port,int socket_family){
 
 int make_listen(const char* host,const char* port,int socket_family){
     int sfd;
-    if((sfd == create_and_bind(host,port,socket_family))==-1){
+    if((sfd = create_and_bind(host,port,socket_family))==-1){
         abort(); // defined in stdlib.h
     }
     if((set_nonblocking(sfd))==-1)
@@ -146,7 +162,7 @@ ssize_t send_bytes(int fd,const unsigned char* buf,size_t len){
     return total;
 err:
     //The send system call — found in section 2, which is for system calls.
-    fprintf(stderr,"send(2) - error sending data",strerror(errno)); //  the number in parentheses indicates the section of the manual
+    fprintf(stderr, "send(2) - error sending data: %s", strerror(errno));//  the number in parentheses indicates the section of the manual
     return -1;    
 }
 
@@ -185,12 +201,12 @@ err:
 }
 
 
-typedef union epoll_data{ 
-    void* ptr;
-    int fd;
-    uint32_t u32;
-    uint64_t u64;
-}epoll_data_t;
+// typedef union epoll_data{ 
+//     void* ptr;
+//     int fd;
+//     uint32_t u32;
+//     uint64_t u64;
+// }epoll_data_t;
 
 
 #define EVLOOP_INITIAL_SIZE 4
@@ -363,7 +379,11 @@ int evloop_wait(struct evloop* el){
                 if(el->events[i].data.fd == el->periodic_tasks[i]->timerfd){
                     // struct closure ->encapsultes a function and its context
                     struct closure* c = el->periodic_tasks[i]->closure; // calls its associated closure
-                    (void) read(el->events[i].data.fd,&timer,8);
+                    ssize_t bytes_read = read(el->events[i].data.fd, &timer, 8);
+                    if (bytes_read < 0) {
+                        perror("read timerfd");
+                        // You might want to handle the error appropriately here
+                    }
                     c->call(el,c->args);
                     periodic_done = 1; // mark this to stop further processing
                 }
